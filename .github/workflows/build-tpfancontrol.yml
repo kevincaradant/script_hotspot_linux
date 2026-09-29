@@ -1,0 +1,96 @@
+name: Build patched TPFanControl
+
+on:
+  push:
+    branches:
+      - chatgpt-tpfancontrol-build
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout helper repo
+        uses: actions/checkout@v4
+
+      - name: Checkout TPFanCtrl2 2.3.3
+        uses: actions/checkout@v4
+        with:
+          repository: Shuzhengz/TPFanCtrl2
+          ref: 2.3.3
+          path: tpfan
+
+      - name: Patch 30C single-jump guard
+        shell: pwsh
+        run: |
+          $path = "tpfan/fancontrol/fanstuff.cpp"
+          $text = Get-Content $path -Raw
+
+          $needle = @'
+          		if (this->State.Sensors[i] != 0x80 && this - State.Sensors[i] != 0x00 && strstr(list, what) == 0) {
+          			int isens = this->State.Sensors[i];
+          			int ioffs = this->SensorOffset[i].offs;
+          '@
+
+          if (-not $text.Contains($needle)) {
+            throw "Patch anchor not found in fanstuff.cpp"
+          }
+
+          $replacement = @'
+          		if (this->State.Sensors[i] != 0x80 && this - State.Sensors[i] != 0x00 && strstr(list, what) == 0) {
+          			int isens = this->State.Sensors[i];
+
+          			// Filter a sudden sensor jump greater than 30 C.
+          			// First outlier is ignored. If the next sample stays close
+          			// to that outlier (within 5 C), the new value is accepted.
+          			static int lastAcceptedSensor[12] = { 0 };
+          			static int pendingSensor[12] = { 0 };
+          			static bool pendingSensorValid[12] = { false };
+
+          			if (lastAcceptedSensor[i] == 0) {
+          				lastAcceptedSensor[i] = isens;
+          			}
+          			else {
+          				int delta = isens - lastAcceptedSensor[i];
+          				if (abs(delta) > 30) {
+          					if (pendingSensorValid[i] && abs(isens - pendingSensor[i]) <= 5) {
+          						lastAcceptedSensor[i] = isens;
+          						pendingSensorValid[i] = false;
+          					}
+          					else {
+          						pendingSensor[i] = isens;
+          						pendingSensorValid[i] = true;
+          						isens = lastAcceptedSensor[i];
+          					}
+          				}
+          				else {
+          					lastAcceptedSensor[i] = isens;
+          					pendingSensorValid[i] = false;
+          				}
+          			}
+
+          			this->State.Sensors[i] = (char)isens;
+          			int ioffs = this->SensorOffset[i].offs;
+          '@
+
+          $text = $text.Replace($needle, $replacement)
+          Set-Content $path $text -Encoding UTF8
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release Win32
+        shell: pwsh
+        run: |
+          msbuild tpfan/fancontrol/fancontrol.sln /m /p:Configuration=Release /p:Platform=Win32
+
+      - name: Collect executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+          Copy-Item "tpfan/fancontrol/Release/TPFanControl.exe" "artifact/TPFanControl_2.3.3_30deg.exe"
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: TPFanControl-2.3.3-30deg
+          path: artifact/TPFanControl_2.3.3_30deg.exe
